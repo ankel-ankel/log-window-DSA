@@ -112,7 +112,6 @@ var (
 )
 
 func main() {
-	log.SetOutput(os.Stdout)
 	flag.IntVar(&config.K, "k", config.K, "Track the top K items")
 	flag.IntVar(&config.Width, "width", config.Width, "Sketch width")
 	flag.IntVar(&config.Depth, "depth", config.Depth, "Sketch depth")
@@ -271,7 +270,8 @@ type model struct {
 	ranker  *IncrementalRanker
 	metrics *latencyMetrics
 
-	mu sync.Mutex
+	done chan struct{}
+	mu   sync.Mutex
 }
 
 func newModel(sketch *sliding.Sketch) *model {
@@ -321,6 +321,7 @@ func newModel(sketch *sliding.Sketch) *model {
 		plotLineColors: make([]plot.Color, config.K+1),
 		ranker:         ranker,
 		metrics:        metrics,
+		done:           make(chan struct{}),
 	}
 	m.leftPaneWidth, m.rightPaneWidth = computePaneWidths(defaultWidth, config.ViewSplit)
 	m.pauseCond = sync.NewCond(&m.pauseMu)
@@ -403,6 +404,9 @@ func (m *model) readTextItems(r io.Reader) error {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	n := 0
 	for scanner.Scan() {
+		if m.isDone() {
+			return nil
+		}
 		m.waitIfPaused()
 		if config.MaxLines > 0 && n >= config.MaxLines {
 			return nil
@@ -437,6 +441,9 @@ func (m *model) readJSONItems(r io.Reader) error {
 			Timestamp any    `json:"timestamp"`
 		}{}
 
+		if m.isDone() {
+			return nil
+		}
 		m.waitIfPaused()
 		if config.MaxLines > 0 && n >= config.MaxLines {
 			return nil
@@ -515,6 +522,9 @@ func (m *model) readAccessLogItems(r io.Reader) error {
 	useEventTime := false
 	n := 0
 	for scanner.Scan() {
+		if m.isDone() {
+			return nil
+		}
 		m.waitIfPaused()
 		if config.MaxLines > 0 && n >= config.MaxLines {
 			return nil
@@ -574,8 +584,11 @@ func (m *model) sketchTickCmd() tui.Cmd {
 	return func() tui.Msg {
 		var last time.Time
 		ticker := time.NewTicker(time.Duration(config.TickSize))
+		defer ticker.Stop()
 		for {
 			select {
+			case <-m.done:
+				return nil
 			case t := <-ticker.C:
 				m.waitIfPaused()
 				if m.timestampsFromData.Load() {
@@ -695,13 +708,8 @@ func (m *model) Update(msg tui.Msg) (tui.Model, tui.Cmd) {
 	case tui.KeyMsg:
 		switch {
 		case key.Matches(msg, keys.Quit):
+			m.shutdown()
 			return m, tui.Quit
-		case key.Matches(msg, keys.Up):
-			m.list.CursorUp()
-			return m, nil
-		case key.Matches(msg, keys.Down):
-			m.list.CursorDown()
-			return m, nil
 		case key.Matches(msg, keys.Pause):
 			m.togglePause()
 			return m, nil
@@ -725,7 +733,12 @@ func (m *model) toggleTracking() {
 }
 
 func (m *model) toggleScale() {
-	m.logScale.Store(!m.logScale.Load())
+	for {
+		old := m.logScale.Load()
+		if m.logScale.CompareAndSwap(old, !old) {
+			return
+		}
+	}
 }
 
 func (m *model) togglePause() {
@@ -743,10 +756,24 @@ func (m *model) isPaused() bool {
 
 func (m *model) waitIfPaused() {
 	m.pauseMu.Lock()
-	for m.paused {
+	for m.paused && !m.isDone() {
 		m.pauseCond.Wait()
 	}
 	m.pauseMu.Unlock()
+}
+
+func (m *model) isDone() bool {
+	select {
+	case <-m.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *model) shutdown() {
+	close(m.done)
+	m.pauseCond.Broadcast()
 }
 
 func (m *model) updateListItemCountsFromSketch() {
@@ -785,7 +812,7 @@ func (m *model) updateTopKIncremental() {
 			m.sketchMu.Unlock()
 		},
 	)
-	m.metrics.observeTopKRefresh(time.Now())
+	m.metrics.observeTopKRefresh(start)
 	m.mu.Lock()
 	m.listItems = items
 	m.mu.Unlock()
@@ -1034,10 +1061,11 @@ func emptyPlot(m *model) strings.Builder {
 	if m.width < 2 || m.height < 4 {
 		return sb
 	}
-	w, h := m.list.Width(), m.list.Height()
+	w := max(1, m.rightWidth()-2)
+	h := max(1, m.list.Height()-2)
 	sb.Grow(w * h)
-	spaces := strings.Repeat(" ", m.list.Width())
-	for range m.list.Height() - 2 {
+	spaces := strings.Repeat(" ", w)
+	for range h {
 		sb.WriteString(spaces)
 		sb.WriteRune('\n')
 	}
@@ -1102,7 +1130,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Quit, k.Pause},
-		{k.Up, k.Down, k.Track, k.Scale},
+		{k.Track, k.Scale},
 	}
 }
 
@@ -1110,9 +1138,6 @@ type keyMap struct {
 	Track key.Binding
 	Scale key.Binding
 	Pause key.Binding
-	Up    key.Binding
-	Down  key.Binding
-	Help  key.Binding
 	Quit  key.Binding
 }
 
@@ -1133,18 +1158,4 @@ var keys = keyMap{
 		key.WithKeys("q", "ctrl+c"),
 		key.WithHelp("q/ctrl+c", "quit"),
 	),
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max[T ~int | ~float64 | ~uint32](a, b T) T {
-	if a > b {
-		return a
-	}
-	return b
 }
