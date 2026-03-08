@@ -28,7 +28,6 @@ go run run.go fast       # fast (no replay, lower FPS)
 
 - `records`: total ingested records.
 - `throughput`: processing speed (records/sec).
-- `refresh p95`: p95 duration of each Top-K ranking refresh.
 - `replay position`: current timestamp in the replayed data (only shown in replay mode).
 - `top-1`: current #1 item and count.
 - `track`: current tracked item when `t` is enabled (`off` if tracking is disabled).
