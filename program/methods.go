@@ -99,12 +99,7 @@ type Proposed struct {
 
 func NewProposed(k, windowTicks int) *Proposed {
 	return &Proposed{
-		sketch: sliding.New(k, windowTicks,
-			sliding.WithWidth(3000),
-			sliding.WithDepth(3),
-			sliding.WithDecay(0.9),
-			sliding.WithDecayLUTSize(8192),
-		),
+		sketch: sliding.New(k, windowTicks),
 		ranker: NewIncrementalRanker(k, 2*time.Second, 0),
 		k:      k,
 	}
